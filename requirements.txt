@@ -1,0 +1,5 @@
+feedparser
+requests
+slack-sdk
+deep-translator
+holidays
