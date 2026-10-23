@@ -2,8 +2,9 @@
 Global News Bot - 대만·일본 노동/HR 뉴스 클리핑
 
 실행 방법
-  python bot.py urgent    # ① 긴급 + ④ 파업·집단소송 + 정부 재해 정보 (매시간)
+  python bot.py urgent    # 긴급: 정부 재해 발표 + 확실한 긴급 키워드 + 기업 파업·소송 (매시간)
                           #   휴일엔 정부 공식 발표만 바로, 나머지는 다음 평일에
+  python bot.py daily     # 일간: 근무 영향 소식 묶음 (평일 아침 1번, 없으면 안 보냄)
   python bot.py weekly    # ②③④ + 정부 기관 발표 (매주)
   python bot.py monthly   # ⑤ 보상 시장 지표 (매월)
   --dry-run : 슬랙으로 보내지 않고 화면에만 출력
@@ -34,7 +35,8 @@ GOV_URGENT = "🏛 정부 공식 발표"   # 휴일에도 바로 보내는 카�
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; GlobalNewsBot/1.0)"}
 INDUSTRY_PER_QUERY = 3      # 기업별 검색은 기사 수를 줄여서 가져와요
 MAX_PER_SECTION = 5         # 한 섹션에 최대 몇 건까지 보여줄지 (나머지는 "외 N건")
-MSG_LIMIT = 3500            # 슬랙 메시지 1개당 최대 글자 수 (넘으면 나눠서 보냄)
+SECTION_LIMIT = 2900        # 슬랙 구역(블록) 1개당 최대 글자 수
+TITLE_MAX = 70              # 제목이 이보다 길면 …로 줄여요
 
 SLACK_TOKEN = os.getenv("SLACK_TOKEN")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL_HRBP")
@@ -329,6 +331,7 @@ def load_state():
     state.setdefault("pending", [])
     state.setdefault("last_weekly", "")
     state.setdefault("last_monthly", "")
+    state.setdefault("last_daily", "")
     return state
 
 
@@ -370,7 +373,7 @@ def is_seen(item, seen):
 # =====================================================================
 def format_item(item):
     ko = translate(item["title"])
-    line = f"• <{item['link']}|{slack_escape(short(ko, 90))}>"
+    line = f"• <{item['link']}|{slack_escape(short(ko, TITLE_MAX))}>"
     meta = []
     if item["source"]:
         src = item["source"]
@@ -387,32 +390,35 @@ def format_item(item):
 
 
 def build_sections(items, order):
-    """카테고리별로 묶고 최신순 정렬"""
+    """카테고리별로 묶고 최신순 정렬 → 섹션 글 목록"""
     translate_many([i["title"].replace("\n", " ") for i in items])   # 한 번에 미리 번역
-    lines = []
+    sections = []
     for label in order:
         group = [i for i in items if i["category"] == label]
         if not group:
             continue
         group.sort(key=lambda i: i["published"] or NOW, reverse=True)
-        lines.append(f"\n*{label}* ({len(group)}건)")
+        count = f"{len(group)}건" if len(group) <= MAX_PER_SECTION else f"최신 {MAX_PER_SECTION}건 / 총 {len(group)}건"
+        text = f"*{label}*  ({count})"
         for item in group[:MAX_PER_SECTION]:
-            lines.append(format_item(item))
-        if len(group) > MAX_PER_SECTION:
-            lines.append(f"     …외 {len(group) - MAX_PER_SECTION}건")
-    return lines
+            line = format_item(item)
+            if len(text) + len(line) + 1 > SECTION_LIMIT:   # 슬랙 블록 1개 글자 수 제한
+                break
+            text += "\n" + line
+        sections.append(text)
+    return sections
 
 
-def split_messages(header, lines):
-    """긴 메시지는 슬랙 제한에 맞게 여러 개로 나눠요"""
-    messages, current = [], header
-    for line in lines:
-        if len(current) + len(line) + 1 > MSG_LIMIT:
-            messages.append(current)
-            current = header + " (이어서)"
-        current += "\n" + line
-    messages.append(current)
-    return messages
+def make_message(title, subtitle, sections):
+    """나라별 메시지 1개: 큰 제목 + 부제 + 카테고리 구역(구분선으로 나눔)"""
+    blocks = [{"type": "header", "text": {"type": "plain_text", "text": short(title, 140), "emoji": True}}]
+    if subtitle:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": subtitle}]})
+    for i, s in enumerate(sections[:20]):
+        if i:
+            blocks.append({"type": "divider"})
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": s}})
+    return {"text": title, "blocks": blocks}
 
 
 def send(messages, dry_run):
@@ -420,14 +426,22 @@ def send(messages, dry_run):
         if not dry_run:
             log("⚠️ SLACK_TOKEN 또는 SLACK_CHANNEL_HRBP 가 없어 화면에만 출력해요.")
         for m in messages:
-            log("\n" + "=" * 60 + "\n" + m)
+            parts = []
+            for b in m["blocks"]:
+                if b["type"] == "divider":
+                    parts.append("-" * 40)
+                elif b["type"] == "context":
+                    parts.append(b["elements"][0]["text"])
+                else:
+                    parts.append(b["text"]["text"])
+            log("\n" + "=" * 60 + "\n" + "\n".join(parts))
         return True
     from slack_sdk import WebClient
     client = WebClient(token=SLACK_TOKEN)
     ok = True
     for m in messages:
         try:
-            client.chat_postMessage(channel=SLACK_CHANNEL, text=m, mrkdwn=True,
+            client.chat_postMessage(channel=SLACK_CHANNEL, text=m["text"], blocks=m["blocks"],
                                     unfurl_links=False, unfurl_media=False)
             time.sleep(1)
         except Exception as e:
@@ -441,7 +455,7 @@ def send(messages, dry_run):
 # =====================================================================
 def run_urgent(dry_run, force=False):
     """
-    평일: 새 소식을 바로 보내고, 휴일에 모아둔 소식도 함께 보냄
+    매시간: 정부 공식 발표 + 확실한 긴급 키워드 + 모니터링 기업 파업·소송만 바로 보냄
     휴일(주말·한국 공휴일): 정부 공식 발표만 바로 보내고, 뉴스는 모아뒀다가 다음 평일에 보냄
     """
     state = load_state()
@@ -466,14 +480,16 @@ def run_urgent(dry_run, force=False):
         if workday:
             held = [i for i in pending if i["country"] == country]
             send_now = merge_duplicates(held + new)
-            title = "긴급 알림" if not held else f"긴급 알림 (휴일 동안 모인 소식 {len(held)}건 포함)"
+            sub = "휴일 동안 모인 소식 포함" if held else ""
+            title = f"🚨 {c['flag']} {c['name']} 긴급 알림"
         else:
             send_now = [i for i in new if i["category"] == GOV_URGENT]
             hold += [i for i in new if i["category"] != GOV_URGENT]
-            title = "휴일 긴급 알림 (정부 공식 발표)"
+            sub = "휴일이라 정부 공식 발표만 보내요"
+            title = f"🚨 {c['flag']} {c['name']} 휴일 긴급 알림"
         if send_now:
-            header = f"🚨 *{c['flag']} {c['name']} {title}* · {NOW.strftime('%m/%d %H:%M')} KST"
-            messages += split_messages(header, build_sections(send_now, order))
+            subtitle = f"{NOW.strftime('%m/%d %H:%M')} KST" + (f" · {sub}" if sub else "")
+            messages.append(make_message(title, subtitle, build_sections(send_now, order)))
 
     ok = send(messages, dry_run) if messages else True
     if not messages:
@@ -487,6 +503,43 @@ def run_urgent(dry_run, force=False):
         save_state(state)
 
 
+def days_since_last_business_day():
+    """오늘 아침 기준, 직전 평일 아침 이후 며칠이 지났는지 (월요일=3, 연휴 뒤엔 더 길게)"""
+    d = NOW
+    n = 0
+    while True:
+        d -= timedelta(days=1)
+        n += 1
+        if is_business_day(d) or n >= 10:
+            return n
+
+
+def run_daily(dry_run, force=False):
+    """평일 아침 1번: 근무에 영향 줄 수 있는 소식 묶음 (없으면 보내지 않음)"""
+    state = load_state()
+    today = NOW.strftime("%Y-%m-%d")
+    if not force and (not is_business_day() or state.get("last_daily") == today):
+        log("⏭ 오늘은 일간 알림을 보내는 날이 아니에요.")
+        return
+    days = days_since_last_business_day()
+    label = config.CATEGORIES["daily"]["label"]
+    messages = []
+    for country, c in config.COUNTRIES.items():
+        log(f"\n☀️ [{c['name']}] 일간 수집 (최근 {days}일)")
+        items = merge_duplicates(collect_keywords(country, "daily", days=days))
+        items = [i for i in items if not is_seen(i, state["seen"])]   # 긴급으로 이미 보낸 건 빼요
+        if items:
+            subtitle = f"{NOW.strftime('%m/%d')} 아침 · 최근 {days}일"
+            messages.append(make_message(f"☀️ {c['flag']} {c['name']} 오늘의 근무 영향 소식",
+                                         subtitle, build_sections(items, [label])))
+    ok = send(messages, dry_run) if messages else True
+    if not messages:
+        log("\n✅ 오늘은 보낼 소식이 없어요.")
+    if ok and not force:
+        state["last_daily"] = today
+        save_state(state)
+
+
 def run_weekly(dry_run, force=False):
     """매주 첫 평일에 1번 (월요일이 공휴일이면 화요일)"""
     state = load_state()
@@ -494,9 +547,9 @@ def run_weekly(dry_run, force=False):
     if not force and (not is_business_day() or state["last_weekly"] == week):
         log("⏭ 오늘은 주간 다이제스트를 보내는 날이 아니에요.")
         return
-    days = 7 + NOW.weekday()   # 월요일이 휴일이라 늦게 보내도 빠지는 날이 없도록
-    order = ["🏛 정부 기관 발표", config.CATEGORIES["law"]["label"],
-             config.CATEGORIES["ruling"]["label"], config.INDUSTRY_LABEL]
+    days = 7 + NOW.weekday() if not force else 7   # 월요일이 휴일이라 늦게 보내도 빠지는 날이 없도록
+    order = [config.CATEGORIES["law"]["label"], config.CATEGORIES["ruling"]["label"],
+             config.INDUSTRY_LABEL, "🏛 정부 기관 발표"]
     start = (NOW - timedelta(days=days)).strftime("%m/%d")
     messages = []
     for country, c in config.COUNTRIES.items():
@@ -506,9 +559,10 @@ def run_weekly(dry_run, force=False):
         items += collect_keywords(country, "ruling", days=days)
         items += collect_industry(country, config.INDUSTRY_ISSUES[country], days=days)
         items = merge_duplicates(items)
-        header = f"📋 *{c['flag']} {c['name']} 주간 노동·HR 뉴스* · {start}~{NOW.strftime('%m/%d')}"
-        lines = build_sections(items, order) or ["이번 주는 해당 소식이 없어요."]
-        messages += split_messages(header, lines)
+        sections = build_sections(items, order) or ["이번 주는 해당 소식이 없어요."]
+        messages.append(make_message(f"📋 {c['flag']} {c['name']} 주간 노동·HR 뉴스",
+                                     f"{start} ~ {NOW.strftime('%m/%d')} · 카테고리별 최신 {MAX_PER_SECTION}건",
+                                     sections))
     if send(messages, dry_run) and not force:
         state["last_weekly"] = week
         save_state(state)
@@ -526,9 +580,9 @@ def run_monthly(dry_run, force=False):
     for country, c in config.COUNTRIES.items():
         log(f"\n💰 [{c['name']}] 월간 수집")
         items = merge_duplicates(collect_keywords(country, "comp", days=31))
-        header = f"💰 *{c['flag']} {c['name']} 월간 보상 시장 지표* · {NOW.strftime('%Y년 %m월')}"
-        lines = build_sections(items, [label]) or ["이번 달은 해당 소식이 없어요."]
-        messages += split_messages(header, lines)
+        sections = build_sections(items, [label]) or ["이번 달은 해당 소식이 없어요."]
+        messages.append(make_message(f"💰 {c['flag']} {c['name']} 월간 보상 시장 지표",
+                                     NOW.strftime("%Y년 %m월"), sections))
     if send(messages, dry_run) and not force:
         state["last_monthly"] = month
         save_state(state)
@@ -538,7 +592,7 @@ if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     dry = "--dry-run" in sys.argv
     force = "--force" in sys.argv   # 수동 실행 시 휴일·중복 체크 없이 바로 보내기
-    runners = {"urgent": run_urgent, "weekly": run_weekly, "monthly": run_monthly}
+    runners = {"urgent": run_urgent, "daily": run_daily, "weekly": run_weekly, "monthly": run_monthly}
     if mode not in runners:
         print(__doc__)
         sys.exit(1)
