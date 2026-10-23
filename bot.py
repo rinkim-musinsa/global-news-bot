@@ -96,31 +96,67 @@ def short(text, n):
 # =====================================================================
 # 번역 (무료 Google 번역, 실패하면 원문 그대로)
 # =====================================================================
-_translator = None
+#   제목을 하나씩 보내면 요청이 너무 많아 차단돼요(TooManyRequests).
+#   그래서 여러 제목을 줄바꿈으로 묶어 한 번에 번역해요.
 _cache = {}
 _fails = 0
+TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
+
+
+def _gtx(text):
+    """Google 번역 1회 요청. 차단되면 잠깐 쉬었다가 최대 3번 시도"""
+    last = "TooManyRequests"
+    for wait in (0, 5, 15):
+        if wait:
+            time.sleep(wait)
+        try:
+            res = requests.post(TRANSLATE_URL, timeout=20, headers=HEADERS,
+                                params={"client": "gtx", "sl": "auto", "tl": "ko", "dt": "t"},
+                                data={"q": text})
+            if res.status_code == 429:
+                continue
+            res.raise_for_status()
+            return "".join(seg[0] for seg in res.json()[0] if seg and seg[0])
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"번역 요청 실패 ({last})")
+
+
+def translate_many(texts):
+    """여러 제목을 묶어서 번역해 캐시에 저장"""
+    global _fails
+    todo = [t for t in dict.fromkeys(texts) if t and t not in _cache]
+    chunks, cur = [], []
+    for t in todo:
+        if cur and sum(len(x) + 1 for x in cur) + len(t) > 3000:
+            chunks.append(cur)
+            cur = []
+        cur.append(t)
+    if cur:
+        chunks.append(cur)
+    for chunk in chunks:
+        if _fails >= 3:   # 계속 실패하면 이번 실행에선 원문으로 보내요
+            return
+        try:
+            out = _gtx("\n".join(chunk)).split("\n")
+            if len(out) != len(chunk):          # 줄 수가 어긋나면 하나씩 번역
+                out = [_gtx(t) for t in chunk]
+            for src, ko in zip(chunk, out):
+                _cache[src] = ko.strip() or src
+            _fails = 0
+            time.sleep(1)
+        except Exception as e:
+            _fails += 1
+            log(f"  ⚠️ 번역 실패, 원문 사용 ({len(chunk)}건): {e}")
 
 
 def translate(text):
-    global _translator, _fails
-    if not text or _fails >= 3:   # 연속 3번 실패하면 이번 실행에선 번역을 건너뛰어요
+    if not text:
         return text
-    if text in _cache:
-        return _cache[text]
-    result = text
-    try:
-        if _translator is None:
-            from deep_translator import GoogleTranslator
-            _translator = GoogleTranslator(source="auto", target="ko")
-        translated = _translator.translate(text[:4500])
-        if translated:
-            result = translated
-        _fails = 0
-    except Exception as e:
-        _fails += 1
-        log(f"  ⚠️ 번역 실패, 원문 사용: {short(text, 30)} ({type(e).__name__})")
-    _cache[text] = result
-    return result
+    key = text.replace("\n", " ")
+    if key not in _cache:
+        translate_many([key])
+    return _cache.get(key, text)
 
 
 # =====================================================================
@@ -162,10 +198,13 @@ def collect_industry(country, issues, days):
     items = []
     companies = config.COMPANIES.get(country, []) + config.COMMON_COMPANIES
     issue_query = "(" + " OR ".join(issues) + ")"
+    words = config.INDUSTRY_TITLE_WORDS.get(country, [])
     for company in companies:
         log(f"  🔍 [{country}] {company} {issue_query}")
-        items += google_news(country, f'"{company}" {issue_query}', days,
-                             INDUSTRY_PER_QUERY, config.INDUSTRY_LABEL)
+        found = google_news(country, f'"{company}" {issue_query}', days,
+                            INDUSTRY_PER_QUERY, config.INDUSTRY_LABEL)
+        # 제목에 노사 관련 단어가 없는 기사(신제품, 세일 소식 등)는 버려요
+        items += [i for i in found if not words or any(w in i["title"] for w in words)]
     return items
 
 
@@ -185,6 +224,8 @@ def collect_gov_feeds(country, days):
                 continue
             title = e.get("title", "")
             if feed["filter"] and not any(w in title for w in feed["filter"]):
+                continue
+            if any(w in title for w in feed.get("exclude", [])):
                 continue
             items.append({
                 "country": country, "category": "🏛 정부 기관 발표", "query": "",
@@ -347,6 +388,7 @@ def format_item(item):
 
 def build_sections(items, order):
     """카테고리별로 묶고 최신순 정렬"""
+    translate_many([i["title"].replace("\n", " ") for i in items])   # 한 번에 미리 번역
     lines = []
     for label in order:
         group = [i for i in items if i["category"] == label]
