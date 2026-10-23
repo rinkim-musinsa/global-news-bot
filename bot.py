@@ -4,8 +4,8 @@ Global News Bot - 대만·일본 노동/HR 뉴스 클리핑
 실행 방법
   python bot.py urgent    # 긴급: 정부 재해 발표 + 확실한 긴급 키워드 + 기업 파업·소송 (매시간)
                           #   휴일엔 정부 공식 발표만 바로, 나머지는 다음 평일에
-  python bot.py daily     # 일간: 근무 영향 소식 묶음 (평일 아침 1번, 없으면 안 보냄)
-  python bot.py weekly    # ②③④ + 정부 기관 발표 (매주)
+  python bot.py daily     # 일간: 근무 영향 소식 + 무신사 언급 (평일 아침 1번, 없으면 안 보냄)
+  python bot.py weekly    # ②③④⑥ + 정부 기관 발표 (매주)
   python bot.py monthly   # ⑤ 보상 시장 지표 (매월)
   --dry-run : 슬랙으로 보내지 않고 화면에만 출력
   --force   : 휴일·이미 보냄 여부와 상관없이 바로 실행 (수동 테스트용)
@@ -37,6 +37,7 @@ INDUSTRY_PER_QUERY = 3      # 기업별 검색은 기사 수를 줄여서 가져
 MAX_PER_SECTION = 5         # 한 섹션에 최대 몇 건까지 보여줄지 (나머지는 "외 N건")
 SECTION_LIMIT = 2900        # 슬랙 구역(블록) 1개당 최대 글자 수
 TITLE_MAX = 70              # 제목이 이보다 길면 …로 줄여요
+TOP_SECTIONS = [config.CATEGORIES["musinsa"]["label"]]   # 최신순 대신 "많이 보도된 순" Top 5
 
 SLACK_TOKEN = os.getenv("SLACK_TOKEN")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL_HRBP")
@@ -192,7 +193,7 @@ def collect_keywords(country, category_key, days):
     items = []
     for kw in cat.get(country, []):
         log(f"  🔍 [{country}] {kw}")
-        items += google_news(country, kw, days, config.PER_QUERY, cat["label"])
+        items += google_news(country, kw, days, cat.get("limit", config.PER_QUERY), cat["label"])
     return items
 
 
@@ -432,8 +433,13 @@ def build_sections(items, order):
         group = [i for i in items if i["category"] == label]
         if not group:
             continue
-        group.sort(key=lambda i: i["published"] or NOW, reverse=True)
-        count = f"{len(group)}건" if len(group) <= MAX_PER_SECTION else f"최신 {MAX_PER_SECTION}건 / 총 {len(group)}건"
+        top = label in TOP_SECTIONS   # 많이 보도된 순(여러 매체가 다룬 기사 먼저)으로 고르는 구역
+        if top:
+            group.sort(key=lambda i: (len(i["also"]), i["published"] or NOW), reverse=True)
+        else:
+            group.sort(key=lambda i: i["published"] or NOW, reverse=True)
+        word = "주요" if top else "최신"
+        count = f"{len(group)}건" if len(group) <= MAX_PER_SECTION else f"{word} {MAX_PER_SECTION}건 / 총 {len(group)}건"
         text = f"*{label}*  ({count})"
         for item in group[:MAX_PER_SECTION]:
             line = format_item(item)
@@ -556,18 +562,20 @@ def run_daily(dry_run, force=False):
         log("⏭ 오늘은 일간 알림을 보내는 날이 아니에요.")
         return
     days = days_since_last_business_day()
-    label = config.CATEGORIES["daily"]["label"]
+    order = [config.CATEGORIES["daily"]["label"], config.CATEGORIES["musinsa"]["label"]]
     messages = []
     sent_today = []
     for country, c in config.COUNTRIES.items():
         log(f"\n☀️ [{c['name']}] 일간 수집 (최근 {days}일)")
-        items = merge_duplicates(collect_keywords(country, "daily", days=days))
+        items = collect_keywords(country, "daily", days=days)
+        items += collect_keywords(country, "musinsa", days=days)
+        items = merge_duplicates(items)
         items = [i for i in items if not is_seen(i, state["seen"])]   # 긴급으로 이미 보낸 건 빼요
         sent_today += items
         if items:
             subtitle = f"{NOW.strftime('%m/%d')} 아침 · 최근 {days}일"
-            messages.append(make_message(f"☀️ {c['flag']} {c['name']} 오늘의 근무 영향 소식",
-                                         subtitle, build_sections(items, [label])))
+            messages.append(make_message(f"☀️ {c['flag']} {c['name']} 아침 소식",
+                                         subtitle, build_sections(items, order)))
     ok = send(messages, dry_run) if messages else True
     if not messages:
         log("\n✅ 오늘은 보낼 소식이 없어요.")
@@ -587,7 +595,7 @@ def run_weekly(dry_run, force=False):
         return
     days = 7 + NOW.weekday() if not force else 7   # 월요일이 휴일이라 늦게 보내도 빠지는 날이 없도록
     order = [config.CATEGORIES["law"]["label"], config.CATEGORIES["ruling"]["label"],
-             config.INDUSTRY_LABEL, "🏛 정부 기관 발표"]
+             config.INDUSTRY_LABEL, config.CATEGORIES["musinsa"]["label"], "🏛 정부 기관 발표"]
     start = (NOW - timedelta(days=days)).strftime("%m/%d")
     messages = []
     for country, c in config.COUNTRIES.items():
@@ -596,6 +604,7 @@ def run_weekly(dry_run, force=False):
         items += collect_keywords(country, "law", days=days)
         items += collect_keywords(country, "ruling", days=days)
         items += collect_industry(country, config.INDUSTRY_ISSUES[country], days=days)
+        items += collect_keywords(country, "musinsa", days=days)
         items = merge_duplicates(items)
         mark_already_sent(state, items)
         sections = build_sections(items, order) or ["이번 주는 해당 소식이 없어요."]
