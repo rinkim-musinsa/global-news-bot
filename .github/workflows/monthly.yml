@@ -1,0 +1,41 @@
+name: Monthly Comp Index (매월 첫 평일)
+on:
+  schedule:
+    - cron: '47 23 * * *'   # 한국 시간 매일 08:47에 확인 → 그 달 첫 평일에 1번만 보냄
+  workflow_dispatch:      # Actions 탭에서 수동 실행 (휴일 체크 없이 바로 보냄)
+
+permissions:
+  contents: write          # 상태 기록(state.json)을 저장하기 위해 필요
+
+concurrency:
+  group: state-file        # 세 워크플로우가 동시에 state.json을 고치지 않도록
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          SLACK_TOKEN: ${{ secrets.SLACK_TOKEN }}
+          SLACK_CHANNEL_HRBP: ${{ secrets.SLACK_CHANNEL_HRBP }}
+        run: python bot.py monthly ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
+
+      - name: Save state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet && exit 0
+          git commit -m "update state (monthly)"
+          git pull --rebase && git push
