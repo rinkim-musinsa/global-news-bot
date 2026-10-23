@@ -381,7 +381,7 @@ def format_item(item):
         meta.append(item["published"].strftime("%m/%d %H:%M"))
     if config.SHOW_ORIGINAL and ko != item["title"]:
         line += f"\n     _{slack_escape(short(item['title'], 60))}_"
-    if meta:
+    if meta and getattr(config, "SHOW_SOURCE", False):   # 매체명·날짜 줄 (기본: 숨김)
         line += f"\n     {slack_escape(' · '.join(meta))}"
     return line
 
