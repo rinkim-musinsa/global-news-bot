@@ -247,7 +247,7 @@ def check_dgpa():
     html = content.decode("utf-8", errors="ignore")
     clean = lambda x: re.sub(r"\s+", " ", re.sub(r"(?s)<[^>]+>", " ", x)).strip()
     groups = {}   # 상태 문구 → 지역 목록
-    for city, status in re.findall(r'(?s)headers="city_Name[^"]*"[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>', html):
+    for city, status in re.findall(r'(?is)headers="city_Name[^"]*"[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>', html):
         city, status = clean(city), clean(status)
         if "停止上班" in status or "停止上課" in status:
             groups.setdefault(status, []).append(city)
@@ -283,7 +283,8 @@ def check_jma():
                 continue
             title = e.get("title", "")
             body = unicodedata.normalize("NFKC", e.get("summary", "") or e.get("content", [{}])[0].get("value", ""))
-            if not match(unicodedata.normalize("NFKC", title) + body):
+            # 제목은 늘 '気象特別警報・警報・注意報'라서 본문으로만 판단해요
+            if not match(body if key == "weather" else unicodedata.normalize("NFKC", title) + body):
                 continue
             items.append({
                 "country": "JP", "category": GOV_URGENT, "query": "",
