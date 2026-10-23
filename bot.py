@@ -238,22 +238,29 @@ def collect_gov_feeds(country, days):
 
 
 def check_dgpa():
-    """대만 인사행정총처 停班停課 페이지에서 '停止上班(출근 중단)' 발표가 있는지 확인"""
+    """대만 인사행정총처 停班停課 표에서 '停止上班/停止上課(출근·등교 중단)'인 지역만 골라요.
+    표 아래 고정 안내문에도 '停止上班'이 들어 있어서, 표의 [지역명 | 상태] 칸만 읽어요."""
     log("  🏛 [TW] 人事行政總處 停班停課")
     content = fetch(config.DGPA_URL)
     if not content:
         return []
     html = content.decode("utf-8", errors="ignore")
-    html = re.sub(r"(?is)<(script|style).*?</\1>", " ", html)
-    text = re.sub(r"(?s)<[^>]+>", "\n", html)
-    lines = [re.sub(r"\s+", " ", l).strip() for l in text.split("\n")]
-    hits = [l for l in lines if "停止上班" in l or "停止上課" in l]
-    if not hits:
+    clean = lambda x: re.sub(r"\s+", " ", re.sub(r"(?s)<[^>]+>", " ", x)).strip()
+    groups = {}   # 상태 문구 → 지역 목록
+    for city, status in re.findall(r'(?s)headers="city_Name[^"]*"[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>', html):
+        city, status = clean(city), clean(status)
+        if "停止上班" in status or "停止上課" in status:
+            groups.setdefault(status, []).append(city)
+    if not groups:
         return []
-    summary = " / ".join(dict.fromkeys(hits))  # 중복 줄 제거
+    parts = []
+    for status, cities in groups.items():
+        names = "、".join(cities[:6]) + (f" 외 {len(cities) - 6}곳" if len(cities) > 6 else "")
+        parts.append(f"{status} ({len(cities)}곳: {names})")
+    summary = " / ".join(parts)
     return [{
         "country": "TW", "category": GOV_URGENT, "query": "",
-        "title": short(f"[人事行政總處] {summary}", 300), "link": config.DGPA_URL,
+        "title": f"[人事行政總處] {summary}", "link": config.DGPA_URL,
         "source": "人事行政總處", "published": NOW, "also": [],
         "key": "dgpa:" + hashlib.md5(summary.encode()).hexdigest(),
     }]
@@ -332,12 +339,14 @@ def load_state():
     state.setdefault("last_weekly", "")
     state.setdefault("last_monthly", "")
     state.setdefault("last_daily", "")
+    state.setdefault("sent_kind", {})
     return state
 
 
 def save_state(state):
     cutoff = (NOW - timedelta(days=config.SEEN_KEEP_DAYS)).isoformat()
     state["seen"] = {k: v for k, v in state["seen"].items() if v >= cutoff}
+    state["sent_kind"] = {k: v for k, v in state.get("sent_kind", {}).items() if k in state["seen"]}
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=1, sort_keys=True)
 
@@ -358,14 +367,37 @@ def item_key(item):
     return item.get("key") or "t:" + norm(item["title"])
 
 
-def is_seen(item, seen):
+def find_seen_key(item, seen):
+    """이미 보낸 기사면 그 기록의 키를, 아니면 None"""
     key = item_key(item)
     if key in seen:
-        return True
+        return key
     if key.startswith("t:"):
         n = key[2:]
-        return any(k.startswith("t:") and similar(k[2:], n) for k in seen)
-    return False
+        for k in seen:
+            if k.startswith("t:") and similar(k[2:], n):
+                return k
+    return None
+
+
+def is_seen(item, seen):
+    return find_seen_key(item, seen) is not None
+
+
+def remember(state, items, kind):
+    """보낸 기사를 기록 (kind: 긴급 / 일간)"""
+    for i in items:
+        k = item_key(i)
+        state["seen"][k] = NOW.isoformat()
+        state["sent_kind"][k] = kind
+
+
+def mark_already_sent(state, items):
+    """주간·월간에서 긴급/일간으로 이미 보낸 기사에 표시를 달아요 (빼지는 않음)"""
+    for i in items:
+        k = find_seen_key(i, state["seen"])
+        if k:
+            i["sent"] = state["sent_kind"].get(k, "발송")
 
 
 # =====================================================================
@@ -373,7 +405,9 @@ def is_seen(item, seen):
 # =====================================================================
 def format_item(item):
     ko = translate(item["title"])
-    line = f"• <{item['link']}|{slack_escape(short(ko, TITLE_MAX))}>"
+    tag = f"_[{item['sent']} 발송]_ " if item.get("sent") else ""   # 이미 긴급/일간으로 보낸 기사 표시
+    limit = 400 if item["category"] == GOV_URGENT else TITLE_MAX   # 정부 공식 발표는 지역 목록이 잘리지 않게
+    line = f"• {tag}<{item['link']}|{slack_escape(short(ko, limit))}>"
     meta = []
     if item["source"]:
         src = item["source"]
@@ -474,8 +508,7 @@ def run_urgent(dry_run, force=False):
         items = merge_duplicates(items)
         new = [i for i in items if not is_seen(i, state["seen"])]
         log(f"  → 새 소식 {len(new)}건 (전체 {len(items)}건)")
-        for i in new:
-            state["seen"][item_key(i)] = NOW.isoformat()
+        remember(state, new, "긴급")
 
         if workday:
             held = [i for i in pending if i["country"] == country]
@@ -524,10 +557,12 @@ def run_daily(dry_run, force=False):
     days = days_since_last_business_day()
     label = config.CATEGORIES["daily"]["label"]
     messages = []
+    sent_today = []
     for country, c in config.COUNTRIES.items():
         log(f"\n☀️ [{c['name']}] 일간 수집 (최근 {days}일)")
         items = merge_duplicates(collect_keywords(country, "daily", days=days))
         items = [i for i in items if not is_seen(i, state["seen"])]   # 긴급으로 이미 보낸 건 빼요
+        sent_today += items
         if items:
             subtitle = f"{NOW.strftime('%m/%d')} 아침 · 최근 {days}일"
             messages.append(make_message(f"☀️ {c['flag']} {c['name']} 오늘의 근무 영향 소식",
@@ -535,8 +570,10 @@ def run_daily(dry_run, force=False):
     ok = send(messages, dry_run) if messages else True
     if not messages:
         log("\n✅ 오늘은 보낼 소식이 없어요.")
-    if ok and not force:
-        state["last_daily"] = today
+    if ok:
+        remember(state, sent_today, "일간")
+        if not force:
+            state["last_daily"] = today
         save_state(state)
 
 
@@ -559,6 +596,7 @@ def run_weekly(dry_run, force=False):
         items += collect_keywords(country, "ruling", days=days)
         items += collect_industry(country, config.INDUSTRY_ISSUES[country], days=days)
         items = merge_duplicates(items)
+        mark_already_sent(state, items)
         sections = build_sections(items, order) or ["이번 주는 해당 소식이 없어요."]
         messages.append(make_message(f"📋 {c['flag']} {c['name']} 주간 노동·HR 뉴스",
                                      f"{start} ~ {NOW.strftime('%m/%d')} · 카테고리별 최신 {MAX_PER_SECTION}건",
@@ -580,6 +618,7 @@ def run_monthly(dry_run, force=False):
     for country, c in config.COUNTRIES.items():
         log(f"\n💰 [{c['name']}] 월간 수집")
         items = merge_duplicates(collect_keywords(country, "comp", days=31))
+        mark_already_sent(state, items)
         sections = build_sections(items, [label]) or ["이번 달은 해당 소식이 없어요."]
         messages.append(make_message(f"💰 {c['flag']} {c['name']} 월간 보상 시장 지표",
                                      NOW.strftime("%Y년 %m월"), sections))
