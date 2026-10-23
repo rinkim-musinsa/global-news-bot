@@ -2,6 +2,7 @@ name: Daily Digest (평일 아침)
 on:
   schedule:
     - cron: '37 23 * * 0-4'   # 한국 시간 월~금 08:37 → 평일이면 1번 (소식 없으면 안 보냄)
+    - cron: '37 1 * * 1-5'    # 한국 시간 월~금 10:37 → 아침에 검색이 실패했을 때만 다시 시도 (이미 보냈으면 건너뜀)
   workflow_dispatch:      # Actions 탭에서 수동 실행 (휴일 체크 없이 바로 보냄)
 
 permissions:
