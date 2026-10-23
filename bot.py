@@ -71,15 +71,36 @@ def to_dt(struct_time):
     return datetime(*struct_time[:6], tzinfo=timezone.utc).astimezone(KST)
 
 
+FETCH_STATS = {"total": 0, "fail": 0, "streak": 0}   # 뉴스 검색 실패 통계 (streak = 연속 실패 수)
+
+
 def fetch(url):
-    """URL 내용을 가져와요. 실패하면 None"""
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=20)
-        res.raise_for_status()
-        return res.content
-    except Exception as e:
-        log(f"  ⚠️ 가져오기 실패: {url} ({e})")
-        return None
+    """URL 내용을 가져와요. 사이트가 잠시 거절하면(429·5xx) 쉬었다가 다시 시도, 끝내 실패하면 None"""
+    last = None
+    waits = (0,) if FETCH_STATS["streak"] >= 4 else (0, 3, 10)   # 계속 막히면 재시도 생략
+    for wait in waits:
+        if wait:
+            time.sleep(wait)
+        try:
+            res = requests.get(url, headers=HEADERS, timeout=20)
+            if res.status_code == 429 or res.status_code >= 500:
+                last = f"{res.status_code}"
+                continue
+            res.raise_for_status()
+            return res.content
+        except Exception as e:
+            last = e
+    log(f"  ⚠️ 가져오기 실패: {url[:90]} ({last})")
+    return None
+
+
+def collection_failed():
+    """뉴스 검색의 절반 넘게 실패했으면 True → 이번엔 보내지 않고 다음 실행 때 다시 시도"""
+    t, f = FETCH_STATS["total"], FETCH_STATS["fail"]
+    if t and f / t > 0.5:
+        log(f"\n⚠️ 뉴스 검색 {t}건 중 {f}건 실패 → 이번엔 보내지 않고 다음 실행 때 다시 시도해요.")
+        return True
+    return False
 
 
 def parse_feed(url):
@@ -171,7 +192,15 @@ def google_news(country, query, days, limit, category):
     url = f"https://news.google.com/rss/search?q={q}&hl={c['hl']}&gl={c['gl']}&ceid={c['ceid']}"
     cutoff = NOW - timedelta(days=days)
     items = []
-    for e in parse_feed(url)[:limit]:
+    content = fetch(url)
+    FETCH_STATS["total"] += 1
+    if content is None:
+        FETCH_STATS["fail"] += 1
+        FETCH_STATS["streak"] += 1
+    else:
+        FETCH_STATS["streak"] = 0
+    entries = feedparser.parse(content).entries if content else []
+    for e in entries[:limit]:
         source = (e.get("source") or {}).get("title", "")
         title = e.get("title", "")
         if source and title.endswith(f" - {source}"):
@@ -576,6 +605,8 @@ def run_daily(dry_run, force=False):
             subtitle = f"{NOW.strftime('%m/%d')} 아침 · 최근 {days}일"
             messages.append(make_message(f"☀️ {c['flag']} {c['name']} 아침 소식",
                                          subtitle, build_sections(items, order)))
+    if collection_failed():
+        return   # 오늘 표시를 남기지 않으니 다음 예약 시간(오전 10:37)에 다시 시도해요
     ok = send(messages, dry_run) if messages else True
     if not messages:
         log("\n✅ 오늘은 보낼 소식이 없어요.")
@@ -611,6 +642,8 @@ def run_weekly(dry_run, force=False):
         messages.append(make_message(f"📋 {c['flag']} {c['name']} 주간 노동·HR 뉴스",
                                      f"{start} ~ {NOW.strftime('%m/%d')} · 카테고리별 최신 {MAX_PER_SECTION}건",
                                      sections))
+    if collection_failed():
+        return   # 다음 평일 아침에 다시 시도해요
     if send(messages, dry_run) and not force:
         state["last_weekly"] = week
         save_state(state)
@@ -632,6 +665,8 @@ def run_monthly(dry_run, force=False):
         sections = build_sections(items, [label]) or ["이번 달은 해당 소식이 없어요."]
         messages.append(make_message(f"💰 {c['flag']} {c['name']} 월간 보상 시장 지표",
                                      NOW.strftime("%Y년 %m월"), sections))
+    if collection_failed():
+        return   # 다음 날 아침에 다시 시도해요
     if send(messages, dry_run) and not force:
         state["last_monthly"] = month
         save_state(state)
