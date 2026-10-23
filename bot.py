@@ -33,7 +33,7 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.jso
 GOV_URGENT = "🏛 정부 공식 발표"   # 휴일에도 바로 보내는 카테고리
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; GlobalNewsBot/1.0)"}
 INDUSTRY_PER_QUERY = 3      # 기업별 검색은 기사 수를 줄여서 가져와요
-MAX_PER_SECTION = 15        # 한 섹션에 최대 몇 건까지 보여줄지
+MAX_PER_SECTION = 5         # 한 섹션에 최대 몇 건까지 보여줄지 (나머지는 "외 N건")
 MSG_LIMIT = 3500            # 슬랙 메시지 1개당 최대 글자 수 (넘으면 나눠서 보냄)
 
 SLACK_TOKEN = os.getenv("SLACK_TOKEN")
