@@ -222,7 +222,11 @@ def collect_keywords(country, category_key, days):
     items = []
     for kw in cat.get(country, []):
         log(f"  🔍 [{country}] {kw}")
-        items += google_news(country, kw, days, cat.get("limit", config.PER_QUERY), cat["label"])
+        found = google_news(country, kw, days, cat.get("limit", config.PER_QUERY), cat["label"])
+        if cat.get("title_only"):   # 키워드(띄어쓰기로 나뉜 단어 모두)가 제목에 있어야 통과
+            words = [norm(w) for w in kw.split()]
+            found = [i for i in found if all(w in norm(i["title"]) for w in words)]
+        items += found
     return items
 
 
