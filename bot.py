@@ -530,7 +530,7 @@ def send(messages, dry_run):
 def run_urgent(dry_run, force=False):
     """
     매시간: 정부 공식 발표 + 확실한 긴급 키워드 + 모니터링 기업 파업·소송만 바로 보냄
-    휴일(주말·한국 공휴일): 정부 공식 발표만 바로 보내고, 뉴스는 모아뒀다가 다음 평일에 보냄
+    휴일(주말·한국 공휴일): 정부 공식 발표만 바로 보내고, 뉴스는 모아뒀다가 다음 평일 08시 이후에 보냄
     """
     state = load_state()
     workday = force or is_business_day()
@@ -538,6 +538,7 @@ def run_urgent(dry_run, force=False):
     log(f"📅 오늘은 {'평일' if workday else '휴일'}이에요.")
 
     pending = [from_json(d) for d in state["pending"]]
+    release_held = force or NOW.hour >= 8   # 휴일에 모은 소식은 평일 08시 이후에만 보내요 (새벽 발송 X)
     messages, hold = [], []
     for country, c in config.COUNTRIES.items():
         log(f"\n🚨 [{c['name']}] 긴급 확인")
@@ -551,7 +552,7 @@ def run_urgent(dry_run, force=False):
         remember(state, new, "긴급")
 
         if workday:
-            held = [i for i in pending if i["country"] == country]
+            held = [i for i in pending if i["country"] == country] if release_held else []
             send_now = merge_duplicates(held + new)
             sub = "휴일 동안 모인 소식 포함" if held else ""
             title = f"🚨 {c['flag']} {c['name']} 긴급 알림"
@@ -569,7 +570,7 @@ def run_urgent(dry_run, force=False):
         log("\n✅ 지금 보낼 긴급 소식 없음")
     if ok:
         if workday:
-            state["pending"] = []
+            state["pending"] = [] if release_held else [to_json(i) for i in pending]
         else:
             state["pending"] = [to_json(i) for i in pending + hold]
             log(f"🗂 다음 평일에 보낼 소식: {len(state['pending'])}건")
