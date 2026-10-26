@@ -174,6 +174,17 @@ def translate_many(texts):
             log(f"  ⚠️ 번역 실패, 원문 사용 ({len(chunk)}건): {e}")
 
 
+def roc_to_ad(text):
+    """대만 민국 연도(예: 115年, 民國115年)를 서기 연도(2026年)로 바꿔요. 번역기가 '2015년'으로 잘못 옮기는 문제 방지"""
+    return re.sub(r"(?:民國|民国)?(?<!\d)(1[01]\d)(?=\s*年)", lambda m: str(int(m.group(1)) + 1911), text or "")
+
+
+def source_text(item):
+    """번역에 넣을 제목 (대만 기사는 연도를 서기로 바꿔서)"""
+    t = item["title"].replace("\n", " ")
+    return roc_to_ad(t) if item.get("country") == "TW" else t
+
+
 def translate(text):
     if not text:
         return text
@@ -439,7 +450,7 @@ def mark_already_sent(state, items):
 # 슬랙 메시지 만들기
 # =====================================================================
 def format_item(item):
-    ko = translate(item["title"])
+    ko = translate(source_text(item))
     tag = f"_[{item['sent']} 발송]_ " if item.get("sent") else ""   # 이미 긴급/일간으로 보낸 기사 표시
     limit = 400 if item["category"] == GOV_URGENT else TITLE_MAX   # 정부 공식 발표는 지역 목록이 잘리지 않게
     line = f"• {tag}<{item['link']}|{slack_escape(short(ko, limit))}>"
@@ -460,7 +471,7 @@ def format_item(item):
 
 def build_sections(items, order):
     """카테고리별로 묶고 최신순 정렬 → 섹션 글 목록"""
-    translate_many([i["title"].replace("\n", " ") for i in items])   # 한 번에 미리 번역
+    translate_many([source_text(i) for i in items])   # 한 번에 미리 번역
     sections = []
     for label in order:
         group = [i for i in items if i["category"] == label]
