@@ -141,6 +141,11 @@ JMA_WARN_CODES = {
 }
 JMA_SPECIAL_CODES = {"35", "32", "33", "39", "38", "37"}   # 특별경보는 태풍이 아니어도 알림
 JMA_TYPHOON_TYPICAL = {"05", "35", "08", "48", "38", "07", "37"}   # 폭풍·해일·파랑 = 태풍 때 주로 나오는 경보
+# 지진: 도쿄 23구·다마에서 아래 진도 이상이 관측되면 알림 (5+ = 진도 5강)
+JMA_QUAKE_DATA = "https://www.jma.go.jp/bosai/quake/data/list.json"
+JMA_QUAKE_PAGE = "https://www.jma.go.jp/bosai/map.html#contents=earthquake_map"
+JMA_QUAKE_MIN = ["5+", "6-", "6+", "7"]
+JMA_QUAKE_CITY_PREFIX = ("131", "132", "1330")   # 23구(131xx)·다마 시부(132xx)·니시타마군(1330x). 섬 지역 제외
 
 # ---------------------------------------------------------------------
 # 기타 설정
