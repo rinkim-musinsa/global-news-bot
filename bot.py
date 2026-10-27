@@ -454,6 +454,41 @@ def check_jma(state):
     return []
 
 
+QUAKE_KO = {"5-": "5약", "5+": "5강", "6-": "6약", "6+": "6강", "7": "7"}
+
+
+def check_quake():
+    """도쿄 23구·다마에서 진도 5강 이상이 관측된 지진 (지진 1건당 1번만 알림)"""
+    log("  🏛 [JP] 気象庁 地震 (東京)")
+    data = fetch_json(config.JMA_QUAKE_DATA)
+    if not data:
+        return []
+    cutoff = (NOW - timedelta(days=1)).isoformat()
+    items, done = [], set()
+    for e in data:
+        eid = e.get("eid")
+        if not eid or eid in done or (e.get("at") or "") < cutoff:
+            continue
+        tokyo = [p for p in e.get("int", []) if p.get("code") == "13"]
+        if not tokyo:
+            continue
+        cities = tokyo[0].get("city", [])
+        mainland = [c for c in cities if str(c.get("code", "")).startswith(config.JMA_QUAKE_CITY_PREFIX)]
+        if mainland:
+            level = max((c.get("maxi", "") for c in mainland), key=lambda m: list(QUAKE_KO).index(m) if m in QUAKE_KO else -1)
+        else:   # 시·구 정보가 없는 속보는 도쿄도 전체 최대 진도로 판단
+            level = tokyo[0].get("maxi", "")
+        if level not in config.JMA_QUAKE_MIN:
+            continue
+        done.add(eid)
+        at = (e.get("at") or "")[5:16].replace("-", "/").replace("T", " ")
+        place = translate(e.get("anm", "")) if e.get("anm") else "진원 정보 확인 중"
+        mag = f" M{e['mag']}" if e.get("mag") else ""
+        text = f"🔶 [{config.JMA_AREA_NAME}] 지진 진도 {QUAKE_KO[level]} 관측 – 진원: {place}{mag} ({at} 발생)"
+        items.append(official_item("JP", text, config.JMA_QUAKE_PAGE, "気象庁", f"quake:{eid}"))
+    return items
+
+
 # =====================================================================
 # 중복 기사 병합 (같은 사건을 여러 매체가 쓴 경우)
 # =====================================================================
@@ -674,7 +709,7 @@ def run_urgent(dry_run, force=False):
     for country, c in config.COUNTRIES.items():
         log(f"\n🚨 [{c['name']}] 긴급 확인")
         items = []
-        items += (check_cwa(state) + check_dgpa(state)) if country == "TW" else check_jma(state)
+        items += (check_cwa(state) + check_dgpa(state)) if country == "TW" else (check_jma(state) + check_quake())
         items += collect_industry(country, config.INDUSTRY_URGENT_ISSUES[country], days=1)
         items = merge_duplicates(items)
         new = [i for i in items if not is_seen(i, state["seen"])]
