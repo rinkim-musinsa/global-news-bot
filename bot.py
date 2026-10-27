@@ -2,9 +2,10 @@
 Global News Bot - 대만·일본 노동/HR 뉴스 클리핑
 
 실행 방법
-  python bot.py urgent    # 긴급: 정부 재해 발표 + 확실한 긴급 키워드 + 기업 파업·소송 (매시간)
-                          #   휴일엔 정부 공식 발표만 바로, 나머지는 다음 평일에
-  python bot.py daily     # 일간: 근무 영향 소식 + 무신사 언급 (평일 아침 1번, 없으면 안 보냄)
+  python bot.py urgent    # 긴급(매시간): ① 공식 발표(도쿄 기상청 경보 / 대만 태풍경보·타이베이 휴무) + 기업 파업·소송
+                          #   휴일엔 공식 발표만 바로, 파업·소송 뉴스는 다음 평일 08시 이후에
+  python bot.py watch     # 저녁 집중 확인(20~23시, 15분마다): 대만 태풍경보 중일 때 타이베이 휴무 발표
+  python bot.py daily     # 일간: 무신사 언급 (평일 아침 1번, 없으면 안 보냄)
   python bot.py weekly    # ②③④⑥ + 정부 기관 발표 (매주)
   python bot.py monthly   # ⑤ 보상 시장 지표 (매월)
   --dry-run : 슬랙으로 보내지 않고 화면에만 출력
@@ -282,62 +283,175 @@ def collect_gov_feeds(country, days):
     return items
 
 
-def check_dgpa():
-    """대만 인사행정총처 停班停課 표에서 '停止上班/停止上課(출근·등교 중단)'인 지역만 골라요.
-    표 아래 고정 안내문에도 '停止上班'이 들어 있어서, 표의 [지역명 | 상태] 칸만 읽어요."""
-    log("  🏛 [TW] 人事行政總處 停班停課")
+def clean_html(x):
+    return re.sub(r"\s+", " ", re.sub(r"(?s)<[^>]+>", " ", x)).strip()
+
+
+def official_item(country, text_ko, link, source, key):
+    """공식 발표 알림 1건 (이미 한국어로 만든 문장이라 번역하지 않아요)"""
+    return {
+        "country": country, "category": GOV_URGENT, "query": "",
+        "title": text_ko, "ko": text_ko, "link": link,
+        "source": source, "published": NOW, "also": [], "key": key,
+    }
+
+
+# ---------------------------------------------------------------------
+# 대만 (1) 예비 알림: 중앙기상서 태풍경보
+# ---------------------------------------------------------------------
+def fetch_cwa_typhoon():
+    """중앙기상서 특보 데이터에서 태풍경보를 찾아요.
+    반환: None(가져오기 실패) / {} (발령 없음) / {"title","issued","content"}"""
+    content = fetch(config.CWA_WARN_DATA)
+    if not content:
+        return None
+    js = content.decode("utf-8", errors="ignore")
+    pat = (r"'title'\s*:\s*'([^']*)'\s*,\s*'issued'\s*:\s*'([^']*)'.*?"
+           r"'content'\s*:\s*'((?:[^'\\]|\\.)*)'")
+    for title, issued, body in re.findall(pat, js, re.S):
+        if "颱風警報" in title:
+            return {"title": title, "issued": issued, "content": body.replace("\\n", "\n")}
+    return {}
+
+
+def check_cwa(state):
+    """해상/육상 태풍경보가 타이베이를 경계 구역에 포함하면 예비 알림 (단계가 바뀔 때만)"""
+    log("  🏛 [TW] 中央氣象署 颱風警報")
+    ty = fetch_cwa_typhoon()
+    if ty is None:
+        return []   # 실패하면 상태를 바꾸지 않고 다음 실행 때 다시 확인
+    prev = state.get("cwa_phase", "")
+    phase = ""
+    if ty and "解除" not in ty["title"]:
+        text = ty["title"] + ty["content"]
+        land = "陸上" in ty["title"]
+        taipei_land = config.TW_CITY in text or "台北市" in text
+        taipei_sea = any(a in text for a in config.TW_SEA_AREAS)
+        if land and taipei_land:
+            phase = "land"
+        elif taipei_sea or taipei_land:
+            phase = "sea"
+    state["cwa_phase"] = phase
+    log(f"    → 태풍경보 단계: {phase or '없음'} (이전: {prev or '없음'})")
+    if phase == prev:
+        return []
+    link = config.CWA_WARN_PAGE
+    key = f"cwa:{phase or 'end'}:{NOW.isoformat()}"
+    if not phase:
+        if not prev:
+            return []
+        return [official_item("TW", "ℹ️ [해제] 중앙기상서 태풍경보가 해제됐거나 타이베이가 경계 구역에서 빠졌어요.",
+                              link, "中央氣象署", key)]
+    name = "육상 태풍경보" if phase == "land" else "해상 태풍경보"
+    issued = ty["issued"][5:] if len(ty["issued"]) > 10 else ty["issued"]
+    text = (f"⚠️ [예비] 중앙기상서 {name} 발령 – 타이베이가 경계 구역에 포함됐어요 ({issued} 발표). "
+            f"휴무 가능성 있음, 보통 전날 저녁(대만 20~22시 = 한국 21~23시)에 확정 예정이에요.")
+    return [official_item("TW", text, link, "中央氣象署", key)]
+
+
+# ---------------------------------------------------------------------
+# 대만 (2) 확정 알림: 인사행정총처 정반정과 현황 – 臺北市 행만
+# ---------------------------------------------------------------------
+def taipei_target(status):
+    """원문 상태에서 대상(출근/등교)을 뽑아요"""
+    t = []
+    if "停止上班" in status:
+        t.append("출근 중단")
+    if "停止上課" in status:
+        t.append("등교 중단")
+    return "·".join(t)
+
+
+def check_dgpa(state):
+    """臺北市 행에 停止上班/停止上課가 게시되면 확정 알림, 내용이 바뀌면 정정 알림"""
+    log("  🏛 [TW] 人事行政總處 停班停課 (臺北市)")
     content = fetch(config.DGPA_URL)
     if not content:
         return []
     html = content.decode("utf-8", errors="ignore")
-    clean = lambda x: re.sub(r"\s+", " ", re.sub(r"(?s)<[^>]+>", " ", x)).strip()
-    groups = {}   # 상태 문구 → 지역 목록
-    for city, status in re.findall(r'(?is)headers="city_Name[^"]*"[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>', html):
-        city, status = clean(city), clean(status)
-        if "停止上班" in status or "停止上課" in status:
-            groups.setdefault(status, []).append(city)
-    if not groups:
+    rows = re.findall(r'(?is)headers="city_Name[^"]*"[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>', html)
+    statuses = [clean_html(s) for c, s in rows if clean_html(c).replace("台", "臺") == config.TW_CITY]
+    status = " / ".join(dict.fromkeys(s for s in statuses if s))
+    stop = "停止上班" in status or "停止上課" in status
+    # '明天(내일)' 발표가 다음 날 '今天(오늘)'로 바뀌는 건 같은 발표라서, 날짜로 바꿔 비교해요
+    d = NOW.date()
+    canon = status.replace("今天", d.strftime("%m/%d")).replace("明天", (d + timedelta(days=1)).strftime("%m/%d"))
+    prev = state.get("dgpa_taipei", "")
+    log(f"    → 臺北市: {status or '게시 없음'} (이전: {prev or '없음'})")
+
+    if not stop:
+        state["dgpa_taipei"] = ""
+        if prev and status:   # 휴무 발표가 '정상 근무'로 바뀐 경우
+            text = f"🔁 [정정] 타이베이시 발표가 바뀌었어요: 휴무 → 정상 근무·등교 / 원문: {status}"
+            return [official_item("TW", text, config.DGPA_URL, "人事行政總處", f"dgpa:{NOW.isoformat()}")]
         return []
-    parts = []
-    for status, cities in groups.items():
-        names = "、".join(cities[:6]) + (f" 외 {len(cities) - 6}곳" if len(cities) > 6 else "")
-        parts.append(f"{status} ({len(cities)}곳: {names})")
-    summary = " / ".join(parts)
-    return [{
-        "country": "TW", "category": GOV_URGENT, "query": "",
-        "title": f"[人事行政總處] {summary}", "link": config.DGPA_URL,
-        "source": "人事行政總處", "published": NOW, "also": [],
-        "key": "dgpa:" + hashlib.md5(summary.encode()).hexdigest(),
-    }]
+    state["dgpa_taipei"] = canon
+    if canon == prev:
+        return []
+    when = translate(status)
+    if prev:
+        text = f"🔁 [정정] 타이베이시 휴무 발표가 바뀌었어요 – {taipei_target(status)} / 적용: {when} (원문: {status})"
+    else:
+        text = f"✅ [확정] 타이베이시 휴무 발표 – {taipei_target(status)} / 적용: {when} (원문: {status})"
+    return [official_item("TW", text, config.DGPA_URL, "人事行政總處", f"dgpa:{NOW.isoformat()}")]
 
 
-def check_jma():
-    """일본 기상청: 특별경보, 진도 5강 이상 지진"""
-    items = []
-    cutoff = NOW - timedelta(days=1)
-    targets = [
-        ("weather", lambda t: "特別警報" in t, "https://www.jma.go.jp/bosai/map.html#contents=warning"),
-        ("quake", lambda t: any(k in t for k in config.JMA_QUAKE_MIN),
-         "https://www.jma.go.jp/bosai/map.html#contents=earthquake_map"),
-    ]
-    for key, match, page in targets:
-        log(f"  🏛 [JP] 気象庁 {key}")
-        for e in parse_feed(config.JMA_FEEDS[key]):
-            updated = to_dt(e.get("updated_parsed"))
-            if updated and updated < cutoff:
+# ---------------------------------------------------------------------
+# 일본: 기상청 도쿄 경보 (주의보 제외)
+# ---------------------------------------------------------------------
+def fetch_json(url):
+    content = fetch(url)
+    if content is None:
+        return None
+    try:
+        return json.loads(content.decode("utf-8"))
+    except Exception as e:
+        log(f"  ⚠️ JSON 해석 실패: {url} ({e})")
+        return None
+
+
+def check_jma(state):
+    """東京地方에 태풍 관련 경보·특별경보가 새로 나오면 알림 (같은 경보가 이어지면 다시 안 보냄)"""
+    log("  🏛 [JP] 気象庁 東京地方 警報")
+    data = fetch_json(config.JMA_WARN_DATA)
+    if data is None:
+        return []
+    reports = data if isinstance(data, list) else [data]
+    reports.sort(key=lambda r: r.get("reportDatetime", ""))
+    latest, heads, last_time = {}, [], ""
+    for r in reports:
+        heads.append(r.get("headlineText") or "")
+        for area in (r.get("warning") or {}).get("class10Items", []):
+            if area.get("areaCode") != config.JMA_AREA_CODE:
                 continue
-            title = e.get("title", "")
-            body = unicodedata.normalize("NFKC", e.get("summary", "") or e.get("content", [{}])[0].get("value", ""))
-            # 제목은 늘 '気象特別警報・警報・注意報'라서 본문으로만 판단해요
-            if not match(body if key == "weather" else unicodedata.normalize("NFKC", title) + body):
-                continue
-            items.append({
-                "country": "JP", "category": GOV_URGENT, "query": "",
-                "title": short(f"[気象庁] {title}: {body}", 200), "link": page,
-                "source": "気象庁", "published": updated, "also": [],
-                "key": "jma:" + e.get("id", title + body),
-            })
-    return items
+            last_time = r.get("reportDatetime", last_time)
+            for k in area.get("kinds", []):
+                if k.get("code"):
+                    latest[k["code"]] = k.get("status", "")
+    active = {c for c, s in latest.items() if s != "解除" and c in config.JMA_WARN_CODES}
+    tc = fetch_json(config.JMA_TC_DATA) or []
+    typhoon = bool(tc) or any("台風" in h for h in heads)
+    head_typhoon = any("台風" in h for h in heads)
+    relevant = {c for c in active
+                if c in config.JMA_SPECIAL_CODES
+                or head_typhoon
+                or (typhoon and c in config.JMA_TYPHOON_TYPICAL)}
+    prev = set(state.get("jma_tokyo", []))
+    state["jma_tokyo"] = sorted(relevant)
+    log(f"    → 발령 중 경보 {sorted(active)} / 태풍 관련 {sorted(relevant)} (이전: {sorted(prev)})")
+    when = last_time[5:16].replace("-", "/").replace("T", " ") if last_time else ""
+    key = f"jma:{','.join(sorted(relevant)) or 'end'}:{NOW.isoformat()}"
+    if relevant - prev:   # 새로 나왔거나 한 단계 올라간 경보가 있을 때만
+        names = ", ".join(config.JMA_WARN_CODES[c] for c in sorted(relevant, key=lambda c: c not in config.JMA_SPECIAL_CODES))
+        head = next((h for h in reversed(heads) if "台風" in h), "") or (heads[-1] if heads else "")
+        text = f"🌀 [{config.JMA_AREA_NAME}] 기상청 경보 발령: {names}" + (f" ({when} 발표)" if when else "")
+        if head:
+            text += f" – {translate(head)}"
+        return [official_item("JP", text, config.JMA_WARN_PAGE, "気象庁", key)]
+    if prev and not relevant:
+        return [official_item("JP", f"ℹ️ [해제] {config.JMA_AREA_NAME}의 태풍 관련 경보가 모두 해제됐어요.",
+                              config.JMA_WARN_PAGE, "気象庁", key)]
+    return []
 
 
 # =====================================================================
@@ -389,7 +503,13 @@ def load_state():
     return state
 
 
+DRY_RUN = False   # --dry-run 이면 상태 기록(state.json)도 바꾸지 않아요
+
+
 def save_state(state):
+    if DRY_RUN:
+        log("🧪 시험 실행이라 상태 기록은 저장하지 않아요.")
+        return
     cutoff = (NOW - timedelta(days=config.SEEN_KEEP_DAYS)).isoformat()
     state["seen"] = {k: v for k, v in state["seen"].items() if v >= cutoff}
     state["sent_kind"] = {k: v for k, v in state.get("sent_kind", {}).items() if k in state["seen"]}
@@ -450,7 +570,7 @@ def mark_already_sent(state, items):
 # 슬랙 메시지 만들기
 # =====================================================================
 def format_item(item):
-    ko = translate(source_text(item))
+    ko = item.get("ko") or translate(source_text(item))   # 공식 발표 알림은 이미 한국어
     tag = f"_[{item['sent']} 발송]_ " if item.get("sent") else ""   # 이미 긴급/일간으로 보낸 기사 표시
     limit = 400 if item["category"] == GOV_URGENT else TITLE_MAX   # 정부 공식 발표는 지역 목록이 잘리지 않게
     line = f"• {tag}<{item['link']}|{slack_escape(short(ko, limit))}>"
@@ -471,7 +591,7 @@ def format_item(item):
 
 def build_sections(items, order):
     """카테고리별로 묶고 최신순 정렬 → 섹션 글 목록"""
-    translate_many([source_text(i) for i in items])   # 한 번에 미리 번역
+    translate_many([source_text(i) for i in items if not i.get("ko")])   # 한 번에 미리 번역
     sections = []
     for label in order:
         group = [i for i in items if i["category"] == label]
@@ -540,12 +660,12 @@ def send(messages, dry_run):
 # =====================================================================
 def run_urgent(dry_run, force=False):
     """
-    매시간: 정부 공식 발표 + 확실한 긴급 키워드 + 모니터링 기업 파업·소송만 바로 보냄
+    매시간: ① 공식 발표(기상청·중앙기상서·인사행정총처) + 모니터링 기업 파업·소송만 바로 보냄
     휴일(주말·한국 공휴일): 정부 공식 발표만 바로 보내고, 뉴스는 모아뒀다가 다음 평일 08시 이후에 보냄
     """
     state = load_state()
     workday = force or is_business_day()
-    order = [GOV_URGENT, config.CATEGORIES["urgent"]["label"], config.INDUSTRY_LABEL]
+    order = [GOV_URGENT, config.INDUSTRY_LABEL]
     log(f"📅 오늘은 {'평일' if workday else '휴일'}이에요.")
 
     pending = [from_json(d) for d in state["pending"]]
@@ -554,8 +674,7 @@ def run_urgent(dry_run, force=False):
     for country, c in config.COUNTRIES.items():
         log(f"\n🚨 [{c['name']}] 긴급 확인")
         items = []
-        items += check_dgpa() if country == "TW" else check_jma()
-        items += collect_keywords(country, "urgent", days=1)
+        items += (check_cwa(state) + check_dgpa(state)) if country == "TW" else check_jma(state)
         items += collect_industry(country, config.INDUSTRY_URGENT_ISSUES[country], days=1)
         items = merge_duplicates(items)
         new = [i for i in items if not is_seen(i, state["seen"])]
@@ -588,6 +707,26 @@ def run_urgent(dry_run, force=False):
         save_state(state)
 
 
+def run_watch(dry_run, force=False):
+    """저녁 집중 확인: 대만 태풍경보가 타이베이에 걸려 있을 때만 휴무 발표를 15분마다 확인"""
+    state = load_state()
+    items = check_cwa(state)
+    if state.get("cwa_phase") or force:
+        items += check_dgpa(state)
+    else:
+        log("  → 타이베이 관련 태풍경보가 없어 휴무 발표 확인은 건너뛰어요 (매시간 확인은 계속)")
+    ok = True
+    if items:
+        c = config.COUNTRIES["TW"]
+        msg = make_message(f"🚨 {c['flag']} {c['name']} 긴급 알림", f"{NOW.strftime('%m/%d %H:%M')} KST",
+                           build_sections(items, [GOV_URGENT]))
+        ok = send([msg], dry_run)
+        if ok:
+            remember(state, items, "긴급")
+    if ok:
+        save_state(state)
+
+
 def days_since_last_business_day():
     """오늘 아침 기준, 직전 평일 아침 이후 며칠이 지났는지 (월요일=3, 연휴 뒤엔 더 길게)"""
     d = NOW
@@ -600,20 +739,19 @@ def days_since_last_business_day():
 
 
 def run_daily(dry_run, force=False):
-    """평일 아침 1번: 근무에 영향 줄 수 있는 소식 묶음 (없으면 보내지 않음)"""
+    """평일 아침 1번: 무신사 언급 (없으면 보내지 않음). ①은 공식 발표 즉시 알림으로 옮겼어요"""
     state = load_state()
     today = NOW.strftime("%Y-%m-%d")
     if not force and (not is_business_day() or state.get("last_daily") == today):
         log("⏭ 오늘은 일간 알림을 보내는 날이 아니에요.")
         return
     days = days_since_last_business_day()
-    order = [config.CATEGORIES["daily"]["label"], config.CATEGORIES["musinsa"]["label"]]
+    order = [config.CATEGORIES["musinsa"]["label"]]
     messages = []
     sent_today = []
     for country, c in config.COUNTRIES.items():
         log(f"\n☀️ [{c['name']}] 일간 수집 (최근 {days}일)")
-        items = collect_keywords(country, "daily", days=days)
-        items += collect_keywords(country, "musinsa", days=days)
+        items = collect_keywords(country, "musinsa", days=days)
         items = merge_duplicates(items)
         items = [i for i in items if not is_seen(i, state["seen"])]   # 긴급으로 이미 보낸 건 빼요
         sent_today += items
@@ -692,7 +830,9 @@ if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     dry = "--dry-run" in sys.argv
     force = "--force" in sys.argv   # 수동 실행 시 휴일·중복 체크 없이 바로 보내기
-    runners = {"urgent": run_urgent, "daily": run_daily, "weekly": run_weekly, "monthly": run_monthly}
+    DRY_RUN = dry
+    runners = {"urgent": run_urgent, "watch": run_watch, "daily": run_daily,
+               "weekly": run_weekly, "monthly": run_monthly}
     if mode not in runners:
         print(__doc__)
         sys.exit(1)
