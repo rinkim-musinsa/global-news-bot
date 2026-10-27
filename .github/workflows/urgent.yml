@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: '7 * * * *'   # 매시간 7분. 휴일엔 정부 공식 발표만 보내고 나머지는 다음 평일에
   workflow_dispatch:      # Actions 탭에서 수동 실행 (휴일 체크 없이 바로 보냄)
+    inputs:
+      dry_run:
+        description: '시험 실행 (슬랙으로 보내지 않고 로그에만 출력)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write          # 상태 기록(state.json)을 저장하기 위해 필요
@@ -29,7 +34,7 @@ jobs:
         env:
           SLACK_TOKEN: ${{ secrets.SLACK_TOKEN }}
           SLACK_CHANNEL_HRBP: ${{ secrets.SLACK_CHANNEL_HRBP }}
-        run: python bot.py urgent ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
+        run: python bot.py urgent ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }} ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: Save state
         run: |
