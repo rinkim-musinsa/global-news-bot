@@ -22,6 +22,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main   # 항상 최신 main을 받아서 state.json 충돌 방지
 
       - uses: actions/setup-python@v5
         with:
