@@ -95,6 +95,16 @@ def fetch(url):
     return None
 
 
+def translation_failed(items):
+    """번역이 30% 넘게 실패했으면 True → 원문투성이로 보내지 않고 다음 예약 시간에 다시 시도"""
+    news = [i for i in items if not i.get("ko")]
+    bad = [i for i in news if not is_translated(i)]
+    if news and len(bad) / len(news) > 0.3:
+        log(f"\n⚠️ 번역 {len(news)}건 중 {len(bad)}건 실패 → 이번엔 보내지 않고 다음 실행 때 다시 시도해요.")
+        return True
+    return False
+
+
 def collection_failed():
     """뉴스 검색의 절반 넘게 실패했으면 True → 이번엔 보내지 않고 다음 실행 때 다시 시도"""
     t, f = FETCH_STATS["total"], FETCH_STATS["fail"]
@@ -125,17 +135,19 @@ def short(text, n):
 #   그래서 여러 제목을 줄바꿈으로 묶어 한 번에 번역해요.
 _cache = {}
 _fails = 0
-TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
+# 한 주소가 막히면(TooManyRequests) 다른 주소로 번갈아 시도해요
+TRANSLATE_URLS = ["https://translate.googleapis.com/translate_a/single",
+                  "https://translate.google.com/translate_a/single"]
 
 
 def _gtx(text):
-    """Google 번역 1회 요청. 차단되면 잠깐 쉬었다가 최대 3번 시도"""
+    """Google 번역 1회 요청. 차단되면 주소를 바꿔 가며 쉬었다가 최대 5번 시도"""
     last = "TooManyRequests"
-    for wait in (0, 5, 15):
+    for n, wait in enumerate((0, 3, 10, 20, 40)):
         if wait:
             time.sleep(wait)
         try:
-            res = requests.post(TRANSLATE_URL, timeout=20, headers=HEADERS,
+            res = requests.post(TRANSLATE_URLS[n % len(TRANSLATE_URLS)], timeout=20, headers=HEADERS,
                                 params={"client": "gtx", "sl": "auto", "tl": "ko", "dt": "t"},
                                 data={"q": text})
             if res.status_code == 429:
@@ -184,6 +196,11 @@ def source_text(item):
     """번역에 넣을 제목 (대만 기사는 연도를 서기로 바꿔서)"""
     t = item["title"].replace("\n", " ")
     return roc_to_ad(t) if item.get("country") == "TW" else t
+
+
+def is_translated(item):
+    """번역이 끝났는지 (공식 발표 알림은 이미 한국어라 항상 True)"""
+    return bool(item.get("ko")) or source_text(item) in _cache
 
 
 def translate(text):
@@ -252,7 +269,10 @@ def collect_industry(country, issues, days):
         found = google_news(country, f'"{company}" {issue_query}', days,
                             INDUSTRY_PER_QUERY, config.INDUSTRY_LABEL)
         # 제목에 노사 관련 단어가 없는 기사(신제품, 세일 소식 등)는 버려요
-        items += [i for i in found if not words or any(w in i["title"] for w in words)]
+        found = [i for i in found if not words or any(w in i["title"] for w in words)]
+        # 제목에 기업 이름(또는 별칭)이 없는 기사(다른 회사 이야기)도 버려요
+        names = [norm(n) for n in [company] + config.COMPANY_ALIASES.get(company, [])]
+        items += [i for i in found if any(n in norm(i["title"]) for n in names)]
     return items
 
 
@@ -719,6 +739,13 @@ def run_urgent(dry_run, force=False):
         if workday:
             held = [i for i in pending if i["country"] == country] if release_held else []
             send_now = merge_duplicates(held + new)
+            # 번역이 안 된 뉴스는 원문으로 보내지 않고 다음 실행 때 다시 시도해요
+            translate_many([source_text(i) for i in send_now if not i.get("ko")])
+            retry = [i for i in send_now if not is_translated(i)]
+            if retry:
+                log(f"  ⏸ 번역 실패로 다음 실행에 다시 보낼 소식 {len(retry)}건")
+                send_now = [i for i in send_now if is_translated(i)]
+                hold += retry
             sub = "휴일 동안 모인 소식 포함" if held else ""
             title = f"🚨 {c['flag']} {c['name']} 긴급 알림"
         else:
@@ -735,7 +762,8 @@ def run_urgent(dry_run, force=False):
         log("\n✅ 지금 보낼 긴급 소식 없음")
     if ok:
         if workday:
-            state["pending"] = [] if release_held else [to_json(i) for i in pending]
+            keep = [] if release_held else pending
+            state["pending"] = [to_json(i) for i in keep + hold]
         else:
             state["pending"] = [to_json(i) for i in pending + hold]
             log(f"🗂 다음 평일에 보낼 소식: {len(state['pending'])}건")
@@ -817,7 +845,7 @@ def run_weekly(dry_run, force=False):
     order = [config.CATEGORIES["law"]["label"], config.CATEGORIES["ruling"]["label"],
              config.INDUSTRY_LABEL, config.CATEGORIES["musinsa"]["label"], "🏛 정부 기관 발표"]
     start = (NOW - timedelta(days=days)).strftime("%m/%d")
-    messages = []
+    messages, everything = [], []
     for country, c in config.COUNTRIES.items():
         log(f"\n📋 [{c['name']}] 주간 수집")
         items = collect_gov_feeds(country, days=days)
@@ -827,12 +855,13 @@ def run_weekly(dry_run, force=False):
         items += collect_keywords(country, "musinsa", days=days)
         items = merge_duplicates(items)
         mark_already_sent(state, items)
+        everything += items
         sections = build_sections(items, order) or ["이번 주는 해당 소식이 없어요."]
         messages.append(make_message(f"📋 {c['flag']} {c['name']} 주간 노동·HR 뉴스",
                                      f"{start} ~ {NOW.strftime('%m/%d')} · 카테고리별 최신 {MAX_PER_SECTION}건",
                                      sections))
-    if collection_failed():
-        return   # 다음 평일 아침에 다시 시도해요
+    if collection_failed() or translation_failed(everything):
+        return   # 다음 예약 시간에 다시 시도해요
     if send(messages, dry_run) and not force:
         state["last_weekly"] = week
         save_state(state)
@@ -846,16 +875,17 @@ def run_monthly(dry_run, force=False):
         log("⏭ 오늘은 월간 지표를 보내는 날이 아니에요.")
         return
     label = config.CATEGORIES["comp"]["label"]
-    messages = []
+    messages, everything = [], []
     for country, c in config.COUNTRIES.items():
         log(f"\n💰 [{c['name']}] 월간 수집")
         items = merge_duplicates(collect_keywords(country, "comp", days=31))
         mark_already_sent(state, items)
+        everything += items
         sections = build_sections(items, [label]) or ["이번 달은 해당 소식이 없어요."]
         messages.append(make_message(f"💰 {c['flag']} {c['name']} 월간 보상 시장 지표",
                                      NOW.strftime("%Y년 %m월"), sections))
-    if collection_failed():
-        return   # 다음 날 아침에 다시 시도해요
+    if collection_failed() or translation_failed(everything):
+        return   # 다음 예약 시간에 다시 시도해요
     if send(messages, dry_run) and not force:
         state["last_monthly"] = month
         save_state(state)
