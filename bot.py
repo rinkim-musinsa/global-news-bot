@@ -159,8 +159,38 @@ def _gtx(text):
     raise RuntimeError(f"번역 요청 실패 ({last})")
 
 
+MYMEMORY_URL = "https://api.mymemory.translated.net/get"
+
+
+def _mymemory(text):
+    """Google 번역이 막혔을 때 쓰는 예비 번역(MyMemory, 무료). 제목 1개씩 번역"""
+    src = "ja" if re.search(r"[\u3040-\u30ff]", text) else "zh-TW"   # 가나가 있으면 일본어
+    res = requests.get(MYMEMORY_URL, timeout=20, headers=HEADERS,
+                       params={"q": text[:450], "langpair": f"{src}|ko"})
+    res.raise_for_status()
+    data = res.json()
+    ko = (data.get("responseData") or {}).get("translatedText") or ""
+    if data.get("responseStatus") != 200 or not ko or data.get("quotaFinished"):
+        raise RuntimeError(f"예비 번역 실패 ({data.get('responseDetails') or data.get('responseStatus')})")
+    return ko
+
+
+def _fallback(chunk):
+    """예비 번역으로 하나씩 번역 (실패한 제목은 건너뜀)"""
+    done = 0
+    for t in chunk:
+        try:
+            _cache[t] = _mymemory(t).strip() or t
+            done += 1
+            time.sleep(0.5)
+        except Exception as e:
+            log(f"  ⚠️ 예비 번역 실패: {e}")
+            break
+    log(f"  🔁 예비 번역(MyMemory)으로 {done}/{len(chunk)}건 번역")
+
+
 def translate_many(texts):
-    """여러 제목을 묶어서 번역해 캐시에 저장"""
+    """여러 제목을 묶어서 번역해 캐시에 저장 (Google이 막히면 예비 번역으로)"""
     global _fails
     todo = [t for t in dict.fromkeys(texts) if t and t not in _cache]
     chunks, cur = [], []
@@ -172,8 +202,9 @@ def translate_many(texts):
     if cur:
         chunks.append(cur)
     for chunk in chunks:
-        if _fails >= 3:   # 계속 실패하면 이번 실행에선 원문으로 보내요
-            return
+        if _fails >= 1:   # Google이 한 번 막히면 이번 실행에선 바로 예비 번역으로
+            _fallback(chunk)
+            continue
         try:
             out = _gtx("\n".join(chunk)).split("\n")
             if len(out) != len(chunk):          # 줄 수가 어긋나면 하나씩 번역
@@ -184,7 +215,8 @@ def translate_many(texts):
             time.sleep(1)
         except Exception as e:
             _fails += 1
-            log(f"  ⚠️ 번역 실패, 원문 사용 ({len(chunk)}건): {e}")
+            log(f"  ⚠️ Google 번역 실패 ({len(chunk)}건): {e} → 예비 번역 시도")
+            _fallback(chunk)
 
 
 def roc_to_ad(text):
@@ -862,8 +894,8 @@ def run_weekly(dry_run, force=False):
                                      sections))
     if collection_failed() or translation_failed(everything):
         return   # 다음 예약 시간에 다시 시도해요
-    if send(messages, dry_run) and not force:
-        state["last_weekly"] = week
+    if send(messages, dry_run) and not dry_run:
+        state["last_weekly"] = week   # 수동 발송도 '이번 주 보냄'으로 기록 (중복 발송 방지)
         save_state(state)
 
 
@@ -886,8 +918,8 @@ def run_monthly(dry_run, force=False):
                                      NOW.strftime("%Y년 %m월"), sections))
     if collection_failed() or translation_failed(everything):
         return   # 다음 예약 시간에 다시 시도해요
-    if send(messages, dry_run) and not force:
-        state["last_monthly"] = month
+    if send(messages, dry_run) and not dry_run:
+        state["last_monthly"] = month   # 수동 발송도 '이번 달 보냄'으로 기록
         save_state(state)
 
 
