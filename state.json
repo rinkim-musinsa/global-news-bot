@@ -5,11 +5,24 @@
  "last_daily": "2026-10-28",
  "last_monthly": "2026-11",
  "last_weekly": "2026-W48",
- "pending": [],
+ "pending": [
+  {
+   "also": [],
+   "category": "④ 패션·리테일 노사이슈",
+   "country": "TW",
+   "link": "https://news.google.com/rss/articles/CBMiX0FVX3lxTE45ZE11c1l6dWdnMFdyZkZBZFVKWHk5ZHZRNkk1QVBSVGhUVmRZOUdtT2oydTYwcDJJMC1oUFBhT3cwTS1lT3AwMnFlRnNmd0c4Vy1fVm5KY2FTM0tsT1RJ?oc=5",
+   "published": "2026-11-28T09:31:00+09:00",
+   "query": "\"ZARA\" (罷工 OR 集體訴訟)",
+   "source": "工商時報",
+   "title": "罷工、政局不穩夾擊孟加拉成衣業！Zara、H＆M等品牌加速轉單印度接最多- 國際"
+  }
+ ],
  "seen": {
-  "t:同公司兩樣情台中簽密約桃園拉布條解析美光勞資角力的三方算計": "2026-11-01T18:05:20.652123+09:00"
+  "t:同公司兩樣情台中簽密約桃園拉布條解析美光勞資角力的三方算計": "2026-11-01T18:05:20.652123+09:00",
+  "t:罷工政局不穩夾擊孟加拉成衣業zarahm等品牌加速轉單印度接最多國際": "2026-11-28T10:22:03.507482+09:00"
  },
  "sent_kind": {
-  "t:同公司兩樣情台中簽密約桃園拉布條解析美光勞資角力的三方算計": "긴급"
+  "t:同公司兩樣情台中簽密約桃園拉布條解析美光勞資角力的三方算計": "긴급",
+  "t:罷工政局不穩夾擊孟加拉成衣業zarahm等品牌加速轉單印度接最多國際": "긴급"
  }
 }
